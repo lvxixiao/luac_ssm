@@ -387,6 +387,7 @@ typedef struct TString {
   CommonHeader;
   lu_byte extra;  /* reserved words for short strings; "has hash" for longs */
   lu_byte shrlen;  /* length for short strings */
+  lu_byte isglobal;	/* 大于0表示是全局字符串 */
   unsigned int hash;
   union {
     size_t lnglen;  /* length for long strings */

@@ -241,6 +241,10 @@ void luaC_barrierback_ (lua_State *L, GCObject *o) {
 
 
 void luaC_fix (lua_State *L, GCObject *o) {
+  if (o->tt == LUA_VSHRSTR && gco2ts(o)->isglobal > 0) {
+    return;
+  }
+
   global_State *g = G(L);
   lua_assert(g->allgc == o);  /* object must be 1st in 'allgc' list! */
   set2gray(o);  /* they will be gray forever */

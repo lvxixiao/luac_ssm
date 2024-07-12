@@ -181,39 +181,7 @@ static void growstrtab (lua_State *L, stringtable *tb) {
     luaS_resize(L, tb->size * 2);
 }
 
-
-/*
-** Checks whether short string exists and reuses it or creates a new one.
-*/
-static TString *internshrstr (lua_State *L, const char *str, size_t l) {
-  TString *ts;
-  global_State *g = G(L);
-  stringtable *tb = &g->strt;
-  unsigned int h = luaS_hash(str, l, g->seed);
-  TString **list = &tb->hash[lmod(h, tb->size)];
-  lua_assert(str != NULL);  /* otherwise 'memcmp'/'memcpy' are undefined */
-  for (ts = *list; ts != NULL; ts = ts->u.hnext) {
-    if (l == ts->shrlen && (memcmp(str, getstr(ts), l * sizeof(char)) == 0)) {
-      /* found! */
-      if (isdead(g, ts))  /* dead (but not collected yet)? */
-        changewhite(ts);  /* resurrect it */
-      return ts;
-    }
-  }
-  /* else must create a new string */
-  if (tb->nuse >= tb->size) {  /* need to grow string table? */
-    growstrtab(L, tb);
-    list = &tb->hash[lmod(h, tb->size)];  /* rehash with new size */
-  }
-  ts = createstrobj(L, l, LUA_VSHRSTR, h);
-  memcpy(getstr(ts), str, l * sizeof(char));
-  ts->shrlen = cast_byte(l);
-  ts->u.hnext = *list;
-  *list = ts;
-  tb->nuse++;
-  return ts;
-}
-
+static TString *internshrstr(lua_State *L, const char *str, size_t l);
 
 /*
 ** new string (with explicit length)
@@ -269,4 +237,206 @@ Udata *luaS_newudata (lua_State *L, size_t s, int nuvalue) {
   for (i = 0; i < nuvalue; i++)
     setnilvalue(&u->uv[i].uv);
   return u;
+}
+
+/**
+ * global shared string
+*/
+#include "rwlock.h"
+#include <stdlib.h>
+
+#define SHRSTR_SLOT 0x10000
+#define HASH_NODE(h) ((h) % SHRSTR_SLOT)
+#define getaddrstr(ts)	(cast(char *, (ts)) + sizeof(UTString))
+
+typedef struct shrmap_slot {
+  struct rwlock lock;
+  TString *str;
+} shrmap_slot;
+
+typedef struct shrmap {
+  shrmap_slot h[SHRSTR_SLOT];
+  int n;
+} shrmap;
+
+static struct shrmap SSM;
+
+
+//初始化共享池
+LUA_API void
+luaS_initssm() {
+  shrmap *s = &SSM;
+  int i;
+  for (i = 0; i < SHRSTR_SLOT; i++) {
+    rwlock_init(&s->h[i].lock);
+  }
+}
+
+//扩充共享池的大小
+LUA_API void
+luaS_expandssm(int n) {
+    __sync_add_and_fetch(&SSM.n, n);
+}
+
+//删除共享池
+LUA_API void
+luaS_exitssm() {
+  int i;
+  for (i = 0; i < SHRSTR_SLOT; i++) {
+      TString *ts = SSM.h[i].str;
+      while (ts) {
+          TString *next = ts->u.hnext;
+          free(ts);
+          ts = next;
+      }
+  }
+}
+
+//打印共享池
+LUA_API int
+luaS_ssminfo(lua_State *L) {
+    //字符串数量, 剩余数量, 字符串总size
+    unsigned int len = 0, size = 0;
+    int i;
+    for (i = 0; i < SHRSTR_SLOT; i++) {
+        shrmap_slot *s = &SSM.h[i];
+        rwlock_rlock(&s->lock);
+        TString *ts = s->str;
+        while(ts) {
+            len++;
+            size += ts->shrlen;
+            ts = ts->u.hnext;
+        }
+
+        rwlock_runlock(&s->lock);
+    }
+
+    lua_pushinteger(L, len);
+    lua_pushinteger(L, size);
+    lua_pushinteger(L, SSM.n);
+    return 3;
+}
+
+static TString *
+newstring(unsigned int h, const char *str, size_t l) {
+  size_t sz = sizelstring(l);
+  TString *ts = malloc(sz);
+  memset(ts, 0, sz);
+  ts->tt = LUA_VSHRSTR;
+  ts->hash = h;
+  ts->shrlen = l;
+  ts->isglobal = 1;
+  memcpy(getstr(ts), str, l * sizeof(char));
+  return ts;
+}
+
+//共享池添加字符串
+static TString *
+addtossm(unsigned int h, const char *str, size_t l) {
+  TString *tmp = newstring(h, str, l);
+  shrmap_slot *s = &SSM.h[HASH_NODE(h)];
+  rwlock_wlock(&s->lock);
+  TString *ts = s->str;
+  while (ts) {
+      // 相同串
+      if(ts->hash == h && ts->shrlen == l 
+          && memcmp(str, getstr(ts), l) == 0) {
+              break;
+      }
+      ts = ts->u.hnext;
+  }
+  if (ts == NULL) {
+      ts = tmp;
+      ts->u.hnext = s->str;
+      s->str = ts;
+      tmp = NULL;
+  }
+  rwlock_wunlock(&s->lock);
+  if(tmp) {
+      // string is create by other thread, so free tmp
+      free(tmp);
+  }
+  return ts;
+}
+
+//共享池查询字符串
+static TString *
+queryfromssm(unsigned int h, const char *str, size_t l) {
+  shrmap_slot *s = &SSM.h[HASH_NODE(h)];
+  rwlock_rlock(&s->lock);
+  TString *ts = s->str;
+  while(ts) {
+        if(ts->hash == h && ts->shrlen == l 
+          && memcmp(str, getstr(ts), l) == 0) {
+              break;
+      }
+      ts = ts->u.hnext;
+  }
+  rwlock_runlock(&s->lock);
+  return ts;
+}
+
+/*
+** checks whether short string exists and reuses it or creates a new one
+*/
+static TString *queryfromstrt(lua_State *L, const char *str, size_t l, unsigned int h) {
+  TString *ts;
+  global_State *g = G(L);
+  stringtable *tb = &g->strt;
+  TString **list = &tb->hash[lmod(h, tb->size)];
+  lua_assert(str != NULL);  /* otherwise 'memcmp'/'memcpy' are undefined */
+  for (ts = *list; ts != NULL; ts = ts->u.hnext) {
+    if (l == ts->shrlen && (memcmp(str, getstr(ts), l * sizeof(char)) == 0)) {
+      /* found! */
+      if (isdead(g, ts))  /* dead (but not collected yet)? */
+        changewhite(ts);  /* resurrect it */
+      return ts;
+    }
+  }
+  return NULL;
+}
+
+
+static TString *addtostrt(lua_State *L, const char *str, size_t l, unsigned int h) {
+  TString *ts;
+  global_State *g = G(L);
+  stringtable *tb = &g->strt;
+  TString **list = &g->strt.hash[lmod(h, g->strt.size)];
+  if (tb->nuse >= tb->size) {  /* need to grow string table? */
+    growstrtab(L, tb);
+    list = &tb->hash[lmod(h, tb->size)];  /* rehash with new size */
+  }
+  ts = createstrobj(L, l, LUA_VSHRSTR, h);
+  memcpy(getstr(ts), str, l * sizeof(char));
+  ts->shrlen = cast_byte(l);
+  ts->u.hnext = *list;
+  ts->isglobal = 0;
+  *list = ts;
+  tb->nuse++;
+  return ts;
+}
+
+static TString *internshrstr (lua_State *L, const char *str, size_t l) {
+  TString *ts;
+  global_State *g = G(L);
+  unsigned int h = luaS_hash(str, l, g->seed);
+  // 从 global state 里查招
+  ts = queryfromstrt(L, str, l, h);
+  if (ts) {
+    return ts;
+  }
+  // 从 ssm 查找
+  unsigned int h0 = luaS_hash(str, l, 0);
+  ts = queryfromssm(h, str, l);
+  if (ts) {
+    return ts;
+  }
+  // 如果 n > 0, 添加到 SSM
+  if (SSM.n > 0) {
+    __sync_sub_and_fetch(&SSM.n, 1);
+    return addtossm(h0, str, l);
+  }
+
+  /* else must create a new string */
+  return addtostrt(L, str, l, h);
 }
